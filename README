@@ -1,0 +1,275 @@
+As part of this assignment , we have demonstrated 13 kernel hacking option to trigger and catch various bugs in kernel code. 
+
+System Design : 
+To facilitate triggering of  KHOs , we have implemented a new system call “__NR_trigger_bug”.   
+The user program takes the command number from users and triggers the respective bug. 
+
+The syscall program is named as "sys_trigger_bug.c". The user program is named as "xtrigger_bug.c"
+The options are defined in a common header file called "common.h" , which is shared between the user and kernel code. Our design ensures efficiency 
+as multiple bugs can be triggered with a single kernel config and single module. Different configs are maintained for the conflicting KHOs. 
+
+We have 3 config files : 
+1. kernel_main.config 
+   -config file to run all Kernel hacking options except BUG_KERNEL_MEM_LEAK (bug code 3) and BUG_DEADLOCK (bug code 5)
+2. memleak_deadlock.config
+   -config file to run 2 kernel hacking options: BUG_KERNEL_MEM_LEAK (bug code 3) and BUG_DEADLOCK (bug code 5) 
+3. without_kho.config
+   -config file without kernel hacking options enabled  
+
+User level validations : 
+1. Missing argument
+   If the user doesn’t give an option along with the command , error message will be returned.
+2. Invalid Argument
+   If the user gives an invalid option , for which bug code is not defined , an error message will be returned to the user.  
+
+We have detected various classes of bugs in the code such as memory management , bugs related to locking , detection of stalls / delays , 
+linked list manipulations , device driver related errors. The options used and code implementation is listed below. 
+
+
+Run Instructions:
+The Makefile is located in CSE-506 dir.
+Also there is a script "install_module.sh" 
+This scripts loads and removes the module along with make. So there is no need to do make separately.
+Simply run: sh install_module.sh
+
+Kernel Hacking Options : 
+
+1. BUG_RW_SEMAPHORE  : [1]
+   Option Enabled : 
+	RW Semaphore debugging: basic checks  ( CONFIG_DEBUG_RWSEMS) 
+   Implementation: 
+	This kernel hacking option allows detection of conflicts in RW semaphore locking. 
+	RW locks can be taken in exclusive / shared mode i.e. in write / read mode. The locks need to be unlocked in the respective mode , 
+	otherwise the critical section can be corrupted or can be in an inconsistent state. 
+	To detect such mismatches , this kernel hacking option is introduced. To trigger this bug we have taken the lock in one mode and 
+	unlocked it in a different mode. The kernel hacking option detects the anomaly and gives a warning message at runtime in dmesg (along with the call trace) as below:
+    DEBUG_LOCKS_WARN_ON (sem->owner != get_current())
+    WARNING: CPU: 0 PID: 6487 at kernel/locking/rwsem.c:134 up_write+0x75/0x80 
+   Command to Run:
+ 	./xtrigger_bug 1
+   NOTE:
+    Reboot kernel before running this option.
+
+
+2. BUG_SLEEP_INSIDE_ATOMIC_SECTION
+   Option Enabled: 
+	Sleep inside atomic section checking (CONFIG_DEBUG_ATOMIC_SLEEP)
+   Implementation: 
+	Spin Locks are fast and held for small critical/atomic sections. So processes are not supposed to sleep inside the atomic section. 
+	This config when enabled detects such occurrences (process sleeping inside the atomic section). In our implementation, the current
+	process holds a spinlock, and inside the atomic section tries to allocate kernel RAM of 10k bytes using kmalloc with 'GFP_KERNEL' in 
+	which the process sleeps. This in turn triggers the bug which is detected when this option is enabled, which is listed in dmesg as:
+	BUG: sleeping function called from invalid context at mm/slab.h:421 [37956.023826] in_atomic() (along with the call trace).
+   Command to Run: 
+    ./xtrigger_bug 2
+
+
+3. BUG_KERNEL_MEM_LEAK
+   Option Enabled: 
+	Kernel memory leak detector (CONFIG_DEBUG_KMEMLEAK)
+   Implementation: 
+	A memory leak occurs when a kernel memory is allocated and not freed. This option when enabled detects memory leaks. We simply 
+	allocated the memory using kmalloc and did not free it.
+    A kernel thread scans the memory every 10 minutes (by default) and prints the number of new unreferenced objects found. To display 
+	the details of all the possible memory leaks [2]:
+    	# mount -t debugfs nodev /sys/kernel/debug/
+    	# cat /sys/kernel/debug/kmemleak
+    	To trigger an intermediate memory scan:
+    	# echo scan > /sys/kernel/debug/kmemleak
+    The file /sys/kernel/debug/kmemleak lists the memleaks as follows:
+    unreferenced object 0xffff9e3037a00000 (size 1000000):
+    comm "xtrigger_bug", pid 4896, jiffies 4294941456 (age 208.064s)hex dump (first 32 bytes):
+    f0 77 ff ff 05 00 00 00 00 00 00 00 00 00 00 00  .w..............
+    1c 00 00 00 74 05 00 00 e8 77 ff ff 32 00 00 00  ....t....w..2...
+    backtrace:
+    [<0000000003ce7d60>] trigger_kernel_mem_leak+0x14/0x30 [sys_trigger_bug]
+
+    Command to Run: 
+    ./xtrigger_bug 3  [Run this twice]
+    NOTE:
+    This won't run in conjuction with debug slab option.
+
+4. BUG_DEBUG_VM_PAGE
+   Options Enabled :  
+	Debug VM (CONFIG_DEBUG_VM) ,  Debug page-flags operations (CONFIG_DEBUG_VM_PGFLAGS)
+   Implementation:
+	This options enables extra validation on page flags operations. To trigger this bug , we have poisoned the “flag” field in the page
+	structure. When we try to free the allocated page , this option gets triggered. It checks the flag field value and gives BUG as the 
+	flag field is corrupted. The bug is shown in dmesg (along with the call trace) as below:
+    BUG: Bad page state in process xtrigger_bug.
+    page ffffca88140... is unitialized and poisoned
+    page dumped because PAGE_FLAGS_CHECK_AT_FREE is set bad because of flags 0x30f231(locked|lru|active|slab|reserved|private|private_2|writeback|unevictable|mlocked)
+   Command to run : 
+	./xtrigger_bug 4 
+
+
+5. BUG_DEADLOCK:
+   Option Enabled : 
+	RT Mutex debugging, deadlock detection (CONFIG_DEBUG_RT_MUTEXES)
+   Implementation : 
+	This option helps us in catching deadlock scenarios and prints info in dmesg on the cause of the deadlock if occured because of 
+	mutex(cyclic dependency). A very obvious scenario would be a race between  two processes trying to grab two mutexes in opposite
+	orders. This would lead to a deadlock in a race condition where one thread takes lock A and the other thread takes lock B and now 
+	they both will wait forever to grab lock B and lock A respectively. 
+	This scenario has been regenerated in the code and demonstrated. 
+	The option emits some useful description of the locks held and possible cause for the deadlock.
+    The dmesg shows the following (along with the call trace):
+    WARNING: bad unlock balance detected!
+    thread1/4888 is trying to release lock (test_mutex_lock2) at:
+    [<ffffffffc026d27e>] t1_func+0x7e/0x110 [sys_trigger_bug] but there are no more locks to release!
+    WARNING: possible circular locking dependency detected
+   Command to Run: 
+	./xtrigger_bug 5
+   NOTE:
+    Reboot the kernel before running this option
+
+
+6. BUG_LINKED_LIST_CORRUPTION
+   Option Enabled : 
+	Debug linked list manipulation (CONFIG_DEBUG_LIST)
+   Implementation:
+	This option helps us in finding/catching bugs at runtime relating to list manipulation in kernel. This is a very strong feature
+	as it catches several types of manipulation bugs. 
+	One particular bug that has been demonstrated in our work is the list corruption. Here we deliberately corrupt the pointer of the node 
+	in a list and then while trying to add a new node there are some extra checks that are performed because of this option which can detect 
+	any pointer mismatches. There is also a way to catch bugs where we add the same node twice in a linked list.(Not Demonstrated though)
+    The dmesg shows the following (along with the call trace):
+    list_add corruption. prev->next should be next (ffffa79b80543e90), but was 00000000deadbeef. (prev=ffff92c574c34d28).
+    WARNING: CPU: 0 PID: 4989 at lib/list_debug.c:28 __list_add_valid+0x6a/0x70
+   Command to Run: 
+	./xtrigger_bug 6
+
+
+7. BUG_SOFT_LOCKUP
+   Option Enabled : 
+	Detect Soft Lockups (CONFIG_SOFTLOCKUP_DETECTOR)
+   Implementation: 
+	This option helps in finding tasks that are looped in kernel mode for more than 20 secs. With the use of this kernel hacking option, 
+	we can find task that take up CPU times unnecessarily. To demonstrate this feature, we simple ran a while loop for around 30 secs. 
+	This essentially makes the thread take up the CPU core for 30 secs. With the option enabled kernel prints out appropriate message,
+	mentioning the thread that caused soft lockup. Also, the thread causing the soft-lockup will automatically die after 30 secs, so that
+	the core does not stall. The bug is shown in dmesg (along with the call trace)as below :
+    watchdog: BUG: soft lockup CPU#1 stuck for 23s![xtrigger_bug:4997]
+   Command to Run: 
+ 	./xtrigger_bug 7
+
+
+8. BUG_INVALID_NOTIFIER
+   Option Enabled : 
+	Debug notifier call chains (CONFIG_DEBUG_NOTIFIERS)
+   Implementation: [3]	
+	This adds sanity check for notifier call chains. Notifier chains allow a device to inform about any event or status through the function 
+	calls registered by the notifiers. Each device maintains a structure called notifier_block, which keeps a list of notifiers that subscribed
+	to the device. Upon an event, the notification publisher module traverses the notifier list and call the event-handlers of each registered 
+	notifiers. But, if the registered event-handler is outside the kernel TEXT segment, it may taint the kernel. Thus, this debug option becomes 
+	helpful for device drivers, to check if their notifiers are valid with correct handler methods registered. To create such a scenario, we have 
+	created a dummy publisher and a dummy subscriber, that passes the event-handler function pointer with a value of 0, which is way outside the 
+	kernel TEXT segment. And we trigger a dummy event from our subscriber, which will catch the issue of invalid notifier handler being registered.
+    The dmesg shows the following (along with the call trace):
+    Invalid notifier called!
+    WARNING: CPU: 1 PID: 4951 at kernel/notifier.c:88 notifier_call_chain+0x86/0x90
+   Command to Run:
+ 	./xtrigger_bug 8
+
+ 
+9. BUG_SCATTERLIST_CHAINED
+   Option Enabled : 
+	Debug SG table operations (CONFIG_DEBUG_SG)
+   Implementation:
+	This option turns on checks on scatter/gather tables. Scatterlist allows us to create huge buffers that are scattered around the physical 
+	memory. Each scatterlist object points to a page in Memory. However, we can chain a single-page scatterlist to point to another scatterlist.
+	Information about whether a scatterlist is chained is maintained by simply overloading the last scatterlist entry in the page_link. However, 
+	it does not make sense to assign a page to an already chained scatterlist object. This, this hacking option enables us to catch such issues 
+	where we incorrectly try to assign a page to a chained scatterlist array. The dmesg shows the following (along with the call trace):
+    kernel BUG at ./include/linux/scatterlist.h:97!
+    invalid opcode: 0000 [#1] SMP PTI
+   Command to Run: 
+	./xtrigger_bug 9
+
+
+10.BUG_DMA_API
+    Option Enabled: 
+	Debug slab memory allocations (CONFIG_DEBUG_SLAB)
+    Implementation: 
+	We create a dummy device with dma capabilities and then allocate DMA-coherent buffers using 
+    	void * dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle, gfp_t flag). 
+	It returns a pointer to the allocated region (consistent memory) or NULL if the allocation fails.
+    We then free this consistent memory allocated passing NULL in the device param in:
+    void dma_free_coherent(struct device *dev, size_t size, void *cpu_addr, dma_addr_t dma_handle). Here cpu_addr is the address of 
+	the allocated DMA-coherent buffer [4].
+    This then triggers the bug where device driver tries to free memory it has not allocated as below in dmesg:
+    NULL NULL: DMA-API: device driver tries to free DMA memory it has not allocated [device address=0x0000000138b51000] [size=100 bytes] 
+	(along with the call trace)
+    Command to Run:
+	 ./xtrigger_bug 10
+
+
+Extra Credits : 
+
+11. SLAB_VALIDATOR 
+    Option Enabled : 
+    Implementation:
+	This is a crucial option that enables various types of checks in the kernel memory allocation functions. Issues like memory overrun and 
+	missing initialization error could be caught using this option. Use-after-free is a common issue encountered with any faulty kernel code 
+	and it becomes difficult to catch such errors as it may not fail under normal circumstances. However, it could lead to kernel panics in 
+	some cases. Thus, this option becomes an useful candidate for any kernel code debugging. To demonstrate, we simply kmalloc’ed an char array 
+	and then kfree’ed it. On subsequent use/access of the same array, the kernel complained of SLAB corruption, because of this kernel hacking 
+	option. The dmesg shows the following:
+    Slab corruption (Tainted: G      D W  OE    ): kmalloc-32 start=ffff9de335ecb960, len=32
+    000: 61 62 63 00 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b  abc.kkkkkkkkkkkk
+    Prev obj: start=ffff9de335ecb940, len=32
+    000: 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b  kkkkkkkkkkkkkkkk
+    010: 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b a5  kkkkkkkkkkkkkkk.
+    Next obj: start=ffff9de335ecb980, len=32
+    000: 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b  kkkkkkkkkkkkkkkk
+    010: 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b a5  kkkkkkkkkkkkkkk.
+    Command to Run: 
+	./xtrigger_bug 11
+    NOTE: 
+	This cannot used in conjunction with the kmemleak option
+
+12. BUG_HUNG_TASK
+    Option Enabled: 
+	Detect Hung Task (CONFIG_DETECT_HUNG_TASK), Default timeout for hung task detection (in seconds) set to 30 for faster detection
+	in demo. Earlier it was 120 seconds, by default. 
+    Implementation: 
+	Hung tasks are the bugs that cause the task to be stuck in uninterruptible “D” state indefinitely. To do this, we created two 
+	threads t1 and t2. Thread t1 acquires lock 1 and thread t2 acquires lock 2. t1 then tries to acquire lock 2 and t2 tries to acquire lock 1. 
+	Since this causes a deadlock situation, both the threads are stuck and the task gets hung. After 30 second (configurable) we get the following
+	in dmesg  along with the call trace
+	INFO: task thread1:8549 blocked for more than 30 seconds.
+	[43106.992007] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+    Command to run: 
+	./xtrigger_bug 12
+    NOTE:
+    Reboot the kernel before running this option.
+
+
+13. BUG_CRED_MANAGEMENT:
+    Option Enabled: 
+	Debug credential management (CONFIG_DEBUG_CREDENTIALS)
+    Implementation: 
+	This debug  option helps us catching bugs where we have grabbed reference to credential structure i.e pertaining to tasks, files etc.
+	and unknowingly mess up with the freeing of the same. We have demonstrated a simple scenario where we try to put back the reference to
+	a cred more than it was grabbed. This is caught by the kernel and error is shown. This is an extra feature just in case prof decides to 
+	count this in.
+    Dmesg shows the following (along with the call trace):
+     kernel BUG at kernel/cred.c:769!
+    invalid opcode: 0000 [#1] SMP PTI
+    CPU: 0 PID: 4950 Comm: xtrigger_bug Tainted: G           OE     4.20.6+ #26
+    RIP: 0010:__invalid_creds+0x47/0x50
+    Command to run: 
+	./xtrigger_bug 13
+
+References : 
+[1] https://lkml.org/lkml/2018/3/27/1192
+[2] https://www.kernel.org/doc/html/v4.19-rc2/dev-tools/kmemleak.html
+[3] https://opensourceforu.com/2009/01/the-crux-of-linux-notifier-chains/
+[4] https://www.kernel.org/doc/Documentation/DMA-API.txt
+[5] https://cateee.net/lkddb/web-lkddb/
+
+
+
+
+
+
